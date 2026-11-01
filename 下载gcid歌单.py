@@ -436,14 +436,22 @@ def search_fallback(song, targets=TARGETS):
 
 
 def resolve(song):
-    """双通道换源：主通道 + 兜底通道。"""
+    """双通道换源：主通道 + 兜底通道（兜底重试几轮）。
+
+    上游搜索的结果排序会波动 —— 同一首歌有时排第 1，有时排到第 5 之后，
+    所以兜底通道必须重试，否则会漏掉本可命中的曲目。
+    """
     alt = switch_source(song)
     if alt:
         return alt
-    alt = search_fallback(song)
-    if alt:
-        alt["score"] = 1.0
-        return alt
+    for attempt in range(3):
+        alt = search_fallback(song)
+        if alt:
+            alt["score"] = 1.0
+            return alt
+        if attempt < 2:
+            print("       [重试] %s 直搜未命中，再试一次" % song["name"][:20])
+            time.sleep(3)
     return None
 
 

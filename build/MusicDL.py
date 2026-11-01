@@ -836,7 +836,16 @@ def download_playlist(base, pl_id, raw_input, work_dir=None):
                   % (i, len(songs), s["name"][:24], alt["source"], alt["score"]))
         else:
             # 换源通道失败：再走直搜兜底通道（按歌名+歌手精确匹配）
-            alt = search_fallback(base, s)
+            # 上游搜索的结果排序会波动（同一首歌有时排第 1，有时排到第 5 之后），
+            # 所以兜底通道要重试几轮，否则会漏掉本可命中的曲目。
+            alt = None
+            for attempt in range(3):
+                alt = search_fallback(base, s)
+                if alt:
+                    break
+                if attempt < 2:
+                    print("       [重试] %s 直搜未命中，再试一次" % s["name"][:20])
+                    time.sleep(3)
             if alt:
                 extra = alt.get("extra") or ""
                 if not isinstance(extra, str):
