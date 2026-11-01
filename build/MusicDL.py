@@ -409,6 +409,16 @@ def http_post_json(base, path, payload, timeout=60):
 # --------------------------------------------------------------------------
 
 def parse_playlist_id(raw):
+    """从 URL 或纯 ID 里提取歌单标识。
+
+    支持两种形态：
+    - 数字精选集：`8691023` 或 https://www.kugou.com/yy/special/single/8691023.html
+    - gcid 用户自建歌单：`gcid_3z1457hyaz3z0c5` 或 .../songlist/gcid_xxx/
+    """
+    raw = (raw or "").strip()
+    m = re.search(r"gcid_[a-zA-Z0-9]+", raw)
+    if m:
+        return m.group(0)
     m = re.search(r"(?:single|playlist)/(\d+)", raw) or re.search(r"\b(\d{5,})\b", raw)
     if not m:
         sys.exit("无法识别歌单 ID: %s" % raw)
@@ -451,6 +461,109 @@ def same_song(orig, got):
     return a == b
 
 
+def extract_kugou_payload(html_text):
+    """从 `window.$output = {...};` 里用括号配平抠出 JSON。
+
+    上游用的是 `({.*?})\\s*;\\s*</script>` 这种非贪婪正则，但真实页面里
+    `}</script>` 前面还有别的内容，正则会匹配失败（报 "songlist payload not found"）。
+    这里改成括号配平，稳。
+    """
+    m = re.search(r"window\.\$output\s*=\s*", html_text)
+    if not m:
+        return None
+    start = m.end()
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(html_text)):
+        ch = html_text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html_text[start:i + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def fetch_songlist_direct(gcid):
+    """直采酷狗 gcid 用户歌单页面，返回歌曲列表。
+
+    为什么要直采：服务端 /playlist 对 gcid 歌单只能解析出 3 首。
+    根因是上游 music-lib 请求 https://www.kugou.com/songlist/{gcid}/ 后，
+    只从页面内嵌 JSON 的 info.songs 里取曲目 —— 而酷狗该页面只内嵌前 10 首
+    （实测 page/pagesize 参数一律无效）。真实总数在 info.listinfo.count。
+
+    酷狗该页面的 song.name 是「歌手 - 歌名」拼接形式（如「喻言 - 蠢货」），
+    真正的歌名必须拆出来，否则拿去换源会整串匹配必然失败。
+    """
+    import html as _html
+    url = "https://m.kugou.com/songlist/%s/" % gcid
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                          "AppleWebKit/605.1.15 Mobile/15E148",
+            "Referer": "https://m.kugou.com/",
+        })
+        text = urllib.request.urlopen(req, timeout=60).read().decode("utf-8", "replace")
+    except Exception as e:
+        print("  [直采失败] %s" % str(e)[:60])
+        return []
+
+    payload = extract_kugou_payload(text)
+    if not payload:
+        print("  [直采失败] 页面结构异常，未能解析 $output")
+        return []
+
+    info = payload.get("info") or {}
+    listinfo = info.get("listinfo") or {}
+    total = int(listinfo.get("count") or 0)
+    songs = []
+    for item in info.get("songs") or []:
+        names = [x.get("name") for x in (item.get("singerinfo") or []) if x.get("name")]
+        artist = "、".join(names)
+        title = item.get("name") or ""
+        if not artist and " - " in title:
+            head, tail = title.split(" - ", 1)
+            artist, title = head.strip(), tail.strip()
+        elif artist and title.startswith(artist + " - "):
+            title = title[len(artist) + 3:].strip()
+        songs.append({
+            "id": item.get("hash") or "",
+            "source": "kugou",
+            "name": title,
+            "artist": artist,
+            "album": item.get("remark") or "",
+            "cover": (item.get("cover") or "").replace("{size}", "240"),
+            "duration": str(int(item.get("timelen") or 0) // 1000),
+            "extra": json.dumps({
+                "album_id": str(item.get("album_id") or ""),
+                "hash": item.get("hash") or "",
+                "file_hash": item.get("hash") or "",
+            }, ensure_ascii=False),
+        })
+
+    print("  直采到 %d 首（官方声明 %d 首，页面仅内嵌 %d 首）"
+          % (len(songs), total, len(songs)))
+    if total > len(songs):
+        print("  [提示] 酷狗对用户自建歌单只公开前 %d 首，其余 %d 首需填 Cookie 才能取"
+              % (len(songs), total - len(songs)))
+    return songs
+
+
 def fetch_songs(base, pl_id, source="kugou"):
     """解析歌单，返回歌曲元数据列表。
 
@@ -459,7 +572,15 @@ def fetch_songs(base, pl_id, source="kugou"):
        所以取全量必须显式传 page_size=500，否则只拿到前 50 首。
     2. 上游限流时不报错，而是返回 HTTP 200 + 空歌曲列表（页面回退成搜索视图）。
        必须用「解析到 0 首」判断限流并退避重试，不能只看 HTTP 状态码。
+    3. gcid_ 开头的用户自建歌单，服务端 /playlist 只能解析出 3 首
+       （上游只从 songlist 页面内嵌 JSON 取 info.songs，而酷狗该页只内嵌 10 首），
+       所以这里改为直采酷狗页面，把可见曲目拿全。
     """
+    if pl_id.startswith("gcid_"):
+        direct = fetch_songlist_direct(pl_id)
+        if direct:
+            return direct
+
     params = {"id": pl_id, "source": source, "page_size": "500"}
     html_text = None
     for attempt in range(5):
@@ -572,7 +693,9 @@ def switch_source(base, song, targets=TARGETS):
         return {
             "id": d["id"], "source": d["source"],
             "name": d.get("name") or song["name"],
-            "artist": d.get("artist") or song["artist"],
+            # 关键：migu 匿名态返回的 artist 常是「🐷🐷」这类占位符，
+            # 必须用原歌单的歌手名覆盖，否则文件会存成「🐷🐷 - 然后.mp3」。
+            "artist": song.get("artist") or d.get("artist") or "",
             "album": d.get("album") or song["album"],
             "cover": d.get("cover") or song["cover"],
             "extra": extra,
@@ -639,6 +762,8 @@ def search_fallback(base, song, targets=TARGETS):
         if cands:
             cands.sort(key=lambda x: x[0])
             diff, best = cands[0]
+            # 同样用原歌单歌手覆盖，避免 migu 匿名态返回「🐷🐷」占位符
+            best["artist"] = song.get("artist") or best["artist"]
             print("       [直搜命中] %s -> %s (%s, 时长差 %ds)"
                   % (want[:20], best["name"][:20], t, diff))
             return best

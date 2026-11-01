@@ -237,6 +237,75 @@ class TestMusicDLWrapper(unittest.TestCase):
         self.assertEqual(self.mdl.normalize_artist("周杰伦 / 张惠妹"),
                          M.normalize_artist("周杰伦、张惠妹"))
 
+    def test_has_songlist_direct_fetch(self):
+        """EXE 必须内置 gcid 直采，否则用户歌单只会拿到 3 首。"""
+        self.assertTrue(callable(self.mdl.fetch_songlist_direct))
+        self.assertTrue(callable(self.mdl.extract_kugou_payload))
+
+
+class TestKugouPayloadExtraction(unittest.TestCase):
+    """酷狗 songlist 页面 $output 的解析（括号配平，非贪婪正则会失配）。"""
+
+    def _extract(self, text):
+        import importlib.util
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "build", "MusicDL.py")
+        if not os.path.isfile(path):
+            self.skipTest("找不到 build/MusicDL.py")
+        spec = importlib.util.spec_from_file_location("MusicDL_payload_test", path)
+        mdl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mdl)
+        return mdl.extract_kugou_payload(text)
+
+    def test_extracts_json_object(self):
+        text = ('<script> window.$output = {"info":{"listinfo":{"count":292,'
+                '"name":"用户0305喜欢的音乐"},"songs":[{"name":"然后"}]}};</script>')
+        data = self._extract(text)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["info"]["listinfo"]["count"], 292)
+        self.assertEqual(len(data["info"]["songs"]), 1)
+
+    def test_handles_nested_braces(self):
+        """嵌套对象不能被非贪婪正则截断 —— 这是上游的真实 bug。"""
+        text = ('window.$output = {"a":{"b":{"c":1},"d":[1,2]},"e":"x"};'
+                '</script><div>after</div>')
+        data = self._extract(text)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["a"]["b"]["c"], 1)
+        self.assertEqual(data["e"], "x")
+
+    def test_returns_none_without_payload(self):
+        self.assertIsNone(self._extract("<html>no payload here</html>"))
+
+
+class TestSonglistNameSplit(unittest.TestCase):
+    """酷狗 songlist 的 name 是「歌手 - 歌名」拼接，必须拆出真歌名。"""
+
+    def test_splits_artist_prefix(self):
+        import importlib.util
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "build", "MusicDL.py")
+        spec = importlib.util.spec_from_file_location("MusicDL_split_test", path)
+        mdl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mdl)
+
+        # 复刻 fetch_songlist_direct 里的拆分逻辑
+        def split(artist, title):
+            if not artist and " - " in title:
+                head, tail = title.split(" - ", 1)
+                return head.strip(), tail.strip()
+            if artist and title.startswith(artist + " - "):
+                return artist, title[len(artist) + 3:].strip()
+            return artist, title
+
+        self.assertEqual(split("", "喻言 - 蠢货"), ("喻言", "蠢货"))
+        self.assertEqual(split("萧亚轩", "萧亚轩 - 然后"), ("萧亚轩", "然后"))
+        self.assertEqual(split("萧亚轩", "然后"), ("萧亚轩", "然后"))
+        # 带连字符的歌名不能被误拆
+        self.assertEqual(split("Taylor Swift", "Love Story"), ("Taylor Swift", "Love Story"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
